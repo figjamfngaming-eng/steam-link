@@ -1,362 +1,199 @@
 import os
 import time
-import hmac
 import json
-import base64
 import secrets
-import sqlite3
-from urllib.parse import urlencode
-
+import urllib.parse
 import requests
-from flask import Flask, request, redirect, abort, jsonify
+from flask import Flask, request, redirect, url_for, jsonify
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 app = Flask(__name__)
 
-# ----------------------------
-# Required Environment Variables
-# ----------------------------
-BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")  # e.g. https://steam-link.onrender.com
-STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "")
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
-LINKED_ROLE_ID = os.environ.get("LINKED_ROLE_ID", "")
-APP_SECRET = os.environ.get("APP_SECRET", "")  # random long string
+# -------------------------
+# ENV / CONFIG
+# -------------------------
+REQUIRED_ENV = ["BASE_URL", "DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID", "LINKED_ROLE_ID", "APP_SECRET"]
+missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
+if missing:
+    # Keep app alive but show a clear message
+    @app.get("/")
+    def _missing_env():
+        return f"Missing env vars: {', '.join(missing)}", 500
+else:
+    pass
 
-# Optional: what role to assign after link
-# Optional: where to store DB
-DB_PATH = os.environ.get("DB_PATH", "linked.db")
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
+LINKED_ROLE_ID = os.getenv("LINKED_ROLE_ID", "")
+APP_SECRET = os.getenv("APP_SECRET", "")
 
-STEAM_OPENID_ENDPOINT = "https://steamcommunity.com/openid/login"
+# Signed state token (prevents tampering)
+serializer = URLSafeTimedSerializer(APP_SECRET)
 
-# Basic startup checks (helps you catch config mistakes instantly)
-def _require_env():
-    missing = []
-    for k, v in [
-        ("BASE_URL", BASE_URL),
-        ("STEAM_API_KEY", STEAM_API_KEY),
-        ("DISCORD_BOT_TOKEN", DISCORD_BOT_TOKEN),
-        ("DISCORD_GUILD_ID", DISCORD_GUILD_ID),
-        ("LINKED_ROLE_ID", LINKED_ROLE_ID),
-        ("APP_SECRET", APP_SECRET),
-    ]:
-        if not v:
-            missing.append(k)
-    if missing:
-        return f"Missing env vars: {', '.join(missing)}"
-    if not BASE_URL.startswith("https://"):
-        return "BASE_URL must start with https:// (Steam OpenID is strict)"
-    return None
+STEAM_OPENID_URL = "https://steamcommunity.com/openid/login"
+
+# Simple JSON storage (works on Render free without DB). You can swap to SQLite later.
+LINK_FILE = "links.json"
 
 
-# ----------------------------
-# SQLite storage
-# ----------------------------
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS links (
-            discord_user_id TEXT PRIMARY KEY,
-            steam_id64 TEXT NOT NULL,
-            persona_name TEXT,
-            avatar_url TEXT,
-            linked_at INTEGER NOT NULL
-        )
-        """
-    )
-    return conn
-
-
-def save_link(discord_user_id: str, steam_id64: str, persona_name: str | None, avatar_url: str | None):
-    conn = db()
+def load_links():
+    if not os.path.exists(LINK_FILE):
+        return {}
     try:
-        conn.execute(
-            """
-            INSERT INTO links(discord_user_id, steam_id64, persona_name, avatar_url, linked_at)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(discord_user_id) DO UPDATE SET
-                steam_id64=excluded.steam_id64,
-                persona_name=excluded.persona_name,
-                avatar_url=excluded.avatar_url,
-                linked_at=excluded.linked_at
-            """,
-            (discord_user_id, steam_id64, persona_name, avatar_url, int(time.time())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        with open(LINK_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-def get_link(discord_user_id: str):
-    conn = db()
-    try:
-        cur = conn.execute(
-            "SELECT discord_user_id, steam_id64, persona_name, avatar_url, linked_at FROM links WHERE discord_user_id=?",
-            (discord_user_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "discord_user_id": row[0],
-            "steam_id64": row[1],
-            "persona_name": row[2],
-            "avatar_url": row[3],
-            "linked_at": row[4],
-        }
-    finally:
-        conn.close()
+def save_links(data: dict):
+    with open(LINK_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
-# ----------------------------
-# Signed state helpers
-# ----------------------------
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def _b64url_decode(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-
-def make_state(discord_user_id: str) -> str:
-    payload = {
-        "duid": str(discord_user_id),
-        "ts": int(time.time()),
-        "nonce": secrets.token_hex(16),
+def discord_add_role(discord_user_id: str):
+    """Add LINKED_ROLE_ID to a member. Handles Discord 429 rate limits."""
+    url = f"https://discord.com/api/v10/guilds/{DISCORD_GUILD_ID}/members/{discord_user_id}/roles/{LINKED_ROLE_ID}"
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "steam-link/1.0"
     }
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    sig = hmac.new(APP_SECRET.encode("utf-8"), raw, digestmod="sha256").digest()
-    return _b64url(raw) + "." + _b64url(sig)
+
+    # retry a few times on 429
+    for _ in range(6):
+        r = requests.put(url, headers=headers, timeout=20)
+        if r.status_code in (204, 201):
+            return True, None
+
+        if r.status_code == 429:
+            try:
+                retry_after = r.json().get("retry_after", 2)
+            except Exception:
+                retry_after = 2
+            time.sleep(float(retry_after) + 0.2)
+            continue
+
+        return False, f"{r.status_code} {r.text}"
+
+    return False, "Rate limited too long (429). Try again."
 
 
-def read_state(state: str) -> dict:
-    try:
-        part_raw, part_sig = state.split(".", 1)
-        raw = _b64url_decode(part_raw)
-        sig = _b64url_decode(part_sig)
-        expected = hmac.new(APP_SECRET.encode("utf-8"), raw, digestmod="sha256").digest()
-        if not hmac.compare_digest(sig, expected):
-            raise ValueError("bad signature")
-        payload = json.loads(raw.decode("utf-8"))
-        # expire after 15 minutes
-        if int(time.time()) - int(payload.get("ts", 0)) > 15 * 60:
-            raise ValueError("state expired")
-        return payload
-    except Exception as e:
-        raise ValueError(f"invalid state: {e}")
+def verify_steam_openid(args: dict) -> bool:
+    """Verify OpenID response by sending check_authentication back to Steam."""
+    verify_args = dict(args)
+    verify_args["openid.mode"] = "check_authentication"
 
-
-# ----------------------------
-# Steam OpenID validation
-# ----------------------------
-def steam_check_authentication(args: dict) -> bool:
-    # Copy all openid.* fields and change mode to check_authentication
-    data = {k: v for k, v in args.items() if k.startswith("openid.")}
-    data["openid.mode"] = "check_authentication"
-
-    r = requests.post(STEAM_OPENID_ENDPOINT, data=data, timeout=20)
-    r.raise_for_status()
+    r = requests.post(STEAM_OPENID_URL, data=verify_args, timeout=20)
     return "is_valid:true" in r.text
 
 
-def extract_steamid64_from_claimed_id(claimed_id: str) -> str | None:
-    # claimed_id usually: https://steamcommunity.com/openid/id/7656119....
+def steamid_from_claimed_id(claimed_id: str) -> str | None:
+    # Example: https://steamcommunity.com/openid/id/7656119xxxxxxxxxx
     if not claimed_id:
         return None
     parts = claimed_id.rstrip("/").split("/")
     if not parts:
         return None
     last = parts[-1]
-    if last.isdigit():
-        return last
-    return None
+    return last if last.isdigit() else None
 
 
-def get_steam_profile(steam_id64: str) -> tuple[str | None, str | None]:
-    # optional but nice for display
-    if not STEAM_API_KEY:
-        return None, None
-    url = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
-    params = {"key": STEAM_API_KEY, "steamids": steam_id64}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    players = data.get("response", {}).get("players", [])
-    if not players:
-        return None, None
-    p = players[0]
-    return p.get("personaname"), p.get("avatarfull")
+# -------------------------
+# ROUTES
+# -------------------------
 
-
-# ----------------------------
-# Discord API helpers (rate-limit safe)
-# ----------------------------
-DISCORD_API = "https://discord.com/api/v10"
-
-def discord_headers():
-    return {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": "12oclockboyz-steam-link/1.0",
-    }
-
-def discord_add_role(discord_user_id: str):
-    # PUT /guilds/{guild.id}/members/{user.id}/roles/{role.id}
-    url = f"{DISCORD_API}/guilds/{DISCORD_GUILD_ID}/members/{discord_user_id}/roles/{LINKED_ROLE_ID}"
-
-    # Try a few times with backoff for 429
-    for attempt in range(1, 6):
-        resp = requests.put(url, headers=discord_headers(), timeout=20)
-
-        if resp.status_code in (204, 201):
-            return  # success
-
-        if resp.status_code == 404:
-            # user not in server or wrong IDs
-            raise RuntimeError("Discord: user not found in guild (is the user in the server?)")
-
-        if resp.status_code == 403:
-            raise RuntimeError("Discord: forbidden. Bot missing permissions or role hierarchy issue.")
-
-        if resp.status_code == 429:
-            # rate limited - follow retry_after if present
-            try:
-                j = resp.json()
-                retry_after = float(j.get("retry_after", 1.0))
-            except Exception:
-                retry_after = 1.0
-            time.sleep(min(retry_after + 0.2, 10))
-            continue
-
-        # other errors
-        raise RuntimeError(f"Discord add role failed: {resp.status_code} {resp.text}")
-
-    raise RuntimeError("Discord rate-limited too long. Try again in 1 minute.")
-
-
-# ----------------------------
-# Routes
-# ----------------------------
 @app.get("/")
 def home():
-    err = _require_env()
-    if err:
-        return f"steam-link service running ✅ BUT CONFIG ERROR: {err}", 500
-    return "steam-link service is running ✅ (use /steam/start?discord_user_id=...)", 200
+    return (
+        "steam-link service is running ✅ "
+        "(use /steam/start?discord_user_id=...)", 200
+    )
 
 
 @app.get("/steam/start")
 def steam_start():
-    err = _require_env()
-    if err:
-        return err, 500
-
     discord_user_id = request.args.get("discord_user_id", "").strip()
+
     if not discord_user_id.isdigit():
-        return "Missing or invalid discord_user_id", 400
+        return "Invalid discord_user_id. Must be digits.", 400
 
-    # Signed state lets callback know which Discord user is linking
-    state = make_state(discord_user_id)
+    # Create a nonce so each link attempt is unique
+    nonce = secrets.token_urlsafe(16)
 
-    return_to = f"{BASE_URL}/steam/callback"
-    realm = BASE_URL
+    # Sign state so it can't be edited
+    state = serializer.dumps({"discord_user_id": discord_user_id, "nonce": nonce})
+
+    # IMPORTANT: Put state into return_to so it comes back on callback
+    return_to = f"{BASE_URL}/steam/callback?state={urllib.parse.quote(state)}"
 
     params = {
         "openid.ns": "http://specs.openid.net/auth/2.0",
         "openid.mode": "checkid_setup",
         "openid.return_to": return_to,
-        "openid.realm": realm,
+        "openid.realm": BASE_URL,
         "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
         "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
-        "state": state,
     }
 
-    return redirect(f"{STEAM_OPENID_ENDPOINT}?{urlencode(params)}", code=302)
+    redirect_url = STEAM_OPENID_URL + "?" + urllib.parse.urlencode(params)
+    return redirect(redirect_url, code=302)
 
 
 @app.get("/steam/callback")
 def steam_callback():
-    err = _require_env()
-    if err:
-        return err, 500
+    # 1) state must exist (it’s how we know which Discord user started this)
+    state = request.args.get("state", "").strip()
+    if not state:
+        return "Invalid state: missing state. Please start again from /steam/start?discord_user_id=...", 400
 
-    # Verify signed state
-    state = request.args.get("state", "")
+    # 2) decode/verify state
     try:
-        payload = read_state(state)
-        discord_user_id = payload["duid"]
-    except ValueError as e:
+        payload = serializer.loads(state, max_age=15 * 60)  # 15 min expiry
+        discord_user_id = payload["discord_user_id"]
+    except SignatureExpired:
+        return "Link session expired. Please start again.", 400
+    except BadSignature:
+        return "Invalid state signature. Please start again.", 400
+    except Exception as e:
         return f"Invalid state: {e}", 400
 
-    # Validate OpenID response with Steam
-    args = request.args.to_dict(flat=True)
-    try:
-        valid = steam_check_authentication(args)
-    except Exception as e:
-        return f"Steam validation request failed: {e}", 500
+    # 3) verify OpenID response with Steam
+    if not verify_steam_openid(request.args.to_dict(flat=True)):
+        return "Steam OpenID verification failed. Please try again.", 400
 
-    if not valid:
-        return "Steam authentication invalid.", 400
-
+    # 4) get SteamID
     claimed_id = request.args.get("openid.claimed_id", "")
-    steam_id64 = extract_steamid64_from_claimed_id(claimed_id)
-    if not steam_id64:
-        return "Could not extract SteamID64.", 400
+    steam_id = steamid_from_claimed_id(claimed_id)
+    if not steam_id:
+        return "Could not read SteamID from OpenID response.", 400
 
-    # Get Steam display info (optional)
-    persona_name = None
-    avatar_url = None
-    try:
-        persona_name, avatar_url = get_steam_profile(steam_id64)
-    except Exception:
-        # If Steam API fails, still link using steam_id64
-        pass
+    # 5) store mapping
+    links = load_links()
+    links[str(discord_user_id)] = {"steam_id": steam_id, "linked_at": int(time.time())}
+    save_links(links)
 
-    # Save mapping
-    save_link(discord_user_id, steam_id64, persona_name, avatar_url)
-
-    # Add Discord role (rate-limit safe)
-    try:
-        discord_add_role(discord_user_id)
-    except Exception as e:
-        # Still show success for linking, but tell you role failed
+    # 6) add Discord role (rate-limit safe)
+    ok, err = discord_add_role(str(discord_user_id))
+    if not ok:
+        # Still linked, but role failed
         return (
-            f"""
-            <h2>Steam linked ✅</h2>
-            <p><b>SteamID:</b> {steam_id64}</p>
-            <p><b>Discord role:</b> FAILED to assign</p>
-            <pre>{str(e)}</pre>
-            <p>Fix bot permissions/role order or try again in a minute.</p>
-            """,
-            200,
+            f"Linked ✅ SteamID: {steam_id}\n"
+            f"BUT role add failed: {err}\n"
+            f"Try again later or re-run the link.",
+            200
         )
 
-    # Success page
-    display = persona_name or "Steam account"
-    return f"""
-        <h2>Linked ✅</h2>
-        <p><b>{display}</b> is now linked to your Discord account.</p>
-        <p><b>SteamID:</b> {steam_id64}</p>
-        <p>You can close this tab and return to Discord.</p>
-    """, 200
+    return f"Linked ✅ SteamID: {steam_id} (role granted)", 200
 
 
-@app.get("/api/link_status")
-def link_status():
-    # optional endpoint for your discord bot to check if user is linked
-    discord_user_id = request.args.get("discord_user_id", "").strip()
-    if not discord_user_id.isdigit():
-        return jsonify({"ok": False, "error": "invalid discord_user_id"}), 400
-
-    link = get_link(discord_user_id)
-    if not link:
-        return jsonify({"ok": True, "linked": False}), 200
-    return jsonify({"ok": True, "linked": True, "data": link}), 200
+@app.get("/api/linked/<discord_user_id>")
+def api_linked(discord_user_id: str):
+    links = load_links()
+    return jsonify(links.get(str(discord_user_id), {})), 200
 
 
-# Render uses $PORT
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    # Local dev
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
