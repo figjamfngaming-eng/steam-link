@@ -7,71 +7,117 @@ from flask import Flask, request, redirect, abort
 
 app = Flask(__name__)
 
+# ---------- ENV ----------
 DB = os.environ.get("LINK_DB", "steam_links.db")
 
-STEAM_API_KEY = os.environ["STEAM_API_KEY"]          # required
-DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]  # required (kept private on server)
-DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
-LINKED_ROLE_ID = int(os.environ["LINKED_ROLE_ID"])
+STEAM_API_KEY = os.environ["STEAM_API_KEY"]                 # required
+DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]         # required
+DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])      # required
+LINKED_ROLE_ID = int(os.environ["LINKED_ROLE_ID"])          # required
+BASE_URL = os.environ["BASE_URL"].rstrip("/")               # required (must match your render domain)
 
-BASE_URL = os.environ["BASE_URL"].rstrip("/")        # e.g. https://your-app.onrender.com
-MXB_APP_ID = 655500  # MX Bikes :contentReference[oaicite:3]{index=3}
-
+MXB_APP_ID = 655500  # MX Bikes
 STEAM_OPENID_ENDPOINT = "https://steamcommunity.com/openid/login"
 
+# How long a link session is valid after /steam/start
+PENDING_TTL_SECONDS = 15 * 60
 
+
+# ---------- DB ----------
 def db_init():
     with sqlite3.connect(DB) as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS pending(
-            state TEXT PRIMARY KEY,
-            discord_user_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        )""")
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS linked(
-            discord_user_id INTEGER PRIMARY KEY,
-            steamid64 TEXT NOT NULL,
-            linked_at INTEGER NOT NULL
-        )""")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending(
+                state TEXT PRIMARY KEY,
+                discord_user_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS linked(
+                discord_user_id INTEGER PRIMARY KEY,
+                steamid64 TEXT NOT NULL,
+                linked_at INTEGER NOT NULL
+            )
+            """
+        )
         con.commit()
 
 
 def new_state() -> str:
-    # good enough for this use-case
     return os.urandom(16).hex()
 
 
-def discord_add_role(discord_user_id: int):
+# ---------- DISCORD HELPERS ----------
+def discord_add_role(discord_user_id: int, max_retries: int = 5) -> tuple[bool, str]:
+    """
+    Adds the Linked role to a user. Handles 429 rate limits with backoff.
+    Returns (success, message).
+    """
     url = f"https://discord.com/api/v10/guilds/{DISCORD_GUILD_ID}/members/{discord_user_id}/roles/{LINKED_ROLE_ID}"
-    r = requests.put(url, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}, timeout=15)
-    if r.status_code not in (204, 201):
-        raise RuntimeError(f"Discord add role failed: {r.status_code} {r.text}")
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+
+    for attempt in range(1, max_retries + 1):
+        r = requests.put(url, headers=headers, timeout=20)
+
+        if r.status_code in (204, 201):
+            return True, "Role assigned"
+
+        # Rate limited
+        if r.status_code == 429:
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+
+            retry_after = data.get("retry_after")
+            if retry_after is None:
+                # fallback: exponential backoff
+                retry_after = min(2 ** attempt, 30)
+
+            time.sleep(float(retry_after) + 0.25)
+            continue
+
+        # Other error (permissions, wrong ids, etc.)
+        return False, f"Discord role add failed: {r.status_code} {r.text}"
+
+    return False, "Discord role add failed: rate limited too long (try again in 1–2 minutes)"
 
 
-def discord_dm(discord_user_id: int, content: str):
-    # create DM channel
+def discord_dm(discord_user_id: int, content: str) -> None:
+    """
+    Best-effort DM. If DMs are closed, do nothing.
+    """
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
+
+    # Create DM channel
     r1 = requests.post(
         "https://discord.com/api/v10/users/@me/channels",
-        headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
+        headers=headers,
         json={"recipient_id": str(discord_user_id)},
-        timeout=15
+        timeout=20,
     )
     if r1.status_code not in (200, 201):
-        return  # DMs might be closed; not fatal
-    channel_id = r1.json()["id"]
+        return
 
-    # send message
+    channel_id = r1.json().get("id")
+    if not channel_id:
+        return
+
     requests.post(
         f"https://discord.com/api/v10/channels/{channel_id}/messages",
-        headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
+        headers=headers,
         json={"content": content},
-        timeout=15
+        timeout=20,
     )
 
 
+# ---------- STEAM HELPERS ----------
 def steamid_from_openid_claimed_id(claimed_id: str) -> str | None:
-    # claimed_id looks like: https://steamcommunity.com/openid/id/<steamid64>
+    # https://steamcommunity.com/openid/id/<steamid64>
     parts = claimed_id.rstrip("/").split("/")
     if parts and parts[-1].isdigit():
         return parts[-1]
@@ -79,22 +125,42 @@ def steamid_from_openid_claimed_id(claimed_id: str) -> str | None:
 
 
 def owns_mxb(steamid64: str) -> bool:
-    # Requires profile game details to be public in many cases
+    """
+    Checks if the Steam account owns MX Bikes via GetOwnedGames.
+    NOTE: requires the user's Game Details visibility to allow access.
+    """
     url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
     params = {
         "key": STEAM_API_KEY,
         "steamid": steamid64,
         "include_appinfo": 0,
         "include_played_free_games": 1,
-        "format": "json"
+        "format": "json",
     }
-    r = requests.get(url, params=params, timeout=20)
+    r = requests.get(url, params=params, timeout=25)
     if r.status_code != 200:
         return False
 
     data = r.json()
     games = data.get("response", {}).get("games", [])
     return any(g.get("appid") == MXB_APP_ID for g in games)
+
+
+def verify_openid_response(args: dict) -> bool:
+    """
+    Validates OpenID response with Steam by calling check_authentication.
+    """
+    verify_args = dict(args)
+    verify_args["openid.mode"] = "check_authentication"
+    vr = requests.post(STEAM_OPENID_ENDPOINT, data=verify_args, timeout=25)
+    return vr.status_code == 200 and "is_valid:true" in vr.text
+
+
+# ---------- ROUTES ----------
+@app.get("/")
+def home():
+    # Helpful non-404 so you know the service is alive
+    return "steam-link service is running ✅ (use /steam/start?discord_user_id=...)", 200
 
 
 @app.get("/steam/start")
@@ -111,10 +177,12 @@ def steam_start():
     now = int(time.time())
 
     with sqlite3.connect(DB) as con:
-        con.execute("INSERT INTO pending(state, discord_user_id, created_at) VALUES(?,?,?)", (state, discord_user_id, now))
+        con.execute(
+            "INSERT INTO pending(state, discord_user_id, created_at) VALUES(?,?,?)",
+            (state, discord_user_id, now),
+        )
         con.commit()
 
-    # Build OpenID redirect
     return_to = f"{BASE_URL}/steam/callback?state={state}"
     realm = BASE_URL
 
@@ -142,49 +210,67 @@ def steam_callback():
 
     # Look up pending request
     with sqlite3.connect(DB) as con:
-        row = con.execute("SELECT discord_user_id, created_at FROM pending WHERE state=?", (state,)).fetchone()
+        row = con.execute(
+            "SELECT discord_user_id, created_at FROM pending WHERE state=?",
+            (state,),
+        ).fetchone()
+
     if not row:
-        abort(400, "Invalid/expired state")
+        abort(400, "Invalid/expired state. Run /link_steam again.")
 
     discord_user_id, created_at = int(row[0]), int(row[1])
-    if int(time.time()) - created_at > 15 * 60:
+    if int(time.time()) - created_at > PENDING_TTL_SECONDS:
         abort(400, "Link expired. Run /link_steam again.")
 
-    # Verify OpenID assertion with Steam (check_authentication)
-    args = dict(request.args)
-    args["openid.mode"] = "check_authentication"
-
-    verify = requests.post(STEAM_OPENID_ENDPOINT, data=args, timeout=20)
-    if verify.status_code != 200 or "is_valid:true" not in verify.text:
+    # Validate OpenID assertion
+    if not verify_openid_response(request.args.to_dict(flat=True)):
         abort(400, "Steam login verification failed.")
 
     claimed_id = request.args.get("openid.claimed_id", "")
     steamid64 = steamid_from_openid_claimed_id(claimed_id)
     if not steamid64:
-        abort(400, "Could not read SteamID.")
+        abort(400, "Could not read SteamID from Steam response.")
 
     # Ownership check for MX Bikes
     if not owns_mxb(steamid64):
-        # Common issue: profile / game details private
-        msg = ("❌ Link failed: could not verify MX Bikes ownership.\n"
-               "Make sure your Steam **Game Details** privacy is set to **Public**, then try again.")
+        msg = (
+            "❌ Link failed: could not verify MX Bikes ownership.\n\n"
+            "Fix: Steam → Profile → Privacy Settings → **Game Details** = **Public**, then run /link_steam again."
+        )
         discord_dm(discord_user_id, msg)
         return msg, 403
 
+    now = int(time.time())
+
     # Save link + cleanup pending
     with sqlite3.connect(DB) as con:
-        con.execute("INSERT OR REPLACE INTO linked(discord_user_id, steamid64, linked_at) VALUES(?,?,?)",
-                    (discord_user_id, steamid64, int(time.time())))
+        con.execute(
+            "INSERT OR REPLACE INTO linked(discord_user_id, steamid64, linked_at) VALUES(?,?,?)",
+            (discord_user_id, steamid64, now),
+        )
         con.execute("DELETE FROM pending WHERE state=?", (state,))
         con.commit()
 
-    # Assign Linked role in Discord
-    discord_add_role(discord_user_id)
-    discord_dm(discord_user_id, "✅ Steam linked and MX Bikes ownership verified. You now have access to races.")
+    # If already has role, skip assigning again (reduces rate-limit hits)
+    # We can't check roles without another API call, so we just try once with safe retry.
+    ok, detail = discord_add_role(discord_user_id)
 
-    return "Linked ✅ You can close this tab and return to Discord."
+    if ok:
+        discord_dm(discord_user_id, "✅ Steam linked and MX Bikes ownership verified. You now have access to races.")
+        return "Linked ✅ You can close this tab and return to Discord.", 200
+
+    # If role assignment fails (rate limit etc), DO NOT 500. Still linked in DB.
+    discord_dm(
+        discord_user_id,
+        "✅ Steam linked and MX Bikes ownership verified.\n"
+        "⚠️ I couldn’t assign your Linked Rider role right now (Discord rate limit).\n"
+        "Wait 1–2 minutes and run /link_steam again ONCE, or ask staff to manually assign Linked Rider.",
+    )
+    return f"Linked ✅ (role assignment pending: {detail})", 200
 
 
+# ---------- MAIN ----------
 if __name__ == "__main__":
     db_init()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
